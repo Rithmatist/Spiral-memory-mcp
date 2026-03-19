@@ -1,0 +1,22 @@
+{
+  "name": "spiral-memory-mcp",
+  "version": "1.0.0",
+  "description": "Spiral Companion orbital memory as an MCP server",
+  "main": "src/index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@hono/node-server": "^1.19.11",
+    "@modelcontextprotocol/sdk": "^1.27.1",
+    "express": "^5.2.1",
+    "sql.js": "^1.14.1",
+    "zod": "^4.3.6"
+  },
+  "bin": {
+    "spiral-memory-mcp": "src/index.js"
+  }
+}
