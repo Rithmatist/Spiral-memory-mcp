@@ -31,11 +31,137 @@ const { randomUUID } = require('crypto');
 const { Server } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/index.js');
 const { StreamableHTTPServerTransport } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/streamableHttp.js');
 const { SSEServerTransport } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/sse.js');
+const { requireBearerAuth } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/auth/middleware/bearerAuth.js');
+const { mcpAuthMetadataRouter, getOAuthProtectedResourceMetadataUrl } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/auth/router.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/types.js');
 const store = require('./store');
 
 const PORT = process.env.PORT || 3838;
 const API_KEY = process.env.API_KEY || null;
+const OAUTH_ENV_VARS = [
+  'PUBLIC_BASE_URL',
+  'OAUTH_ISSUER_URL',
+  'OAUTH_AUTHORIZATION_URL',
+  'OAUTH_TOKEN_URL',
+  'OAUTH_JWKS_URI',
+  'OAUTH_AUDIENCE',
+  'OAUTH_REGISTRATION_URL',
+  'OAUTH_SCOPES',
+];
+
+function parseCsv(value) {
+  if (!value) return [];
+  return value.split(',').map(part => part.trim()).filter(Boolean);
+}
+
+function isLocalHostname(hostname) {
+  return hostname === 'localhost' || hostname === '127.0.0.1';
+}
+
+function getBearerToken(req) {
+  const header = req.headers['authorization'];
+  if (!header || typeof header !== 'string') return null;
+  const [type, token] = header.split(' ');
+  if (!token || type.toLowerCase() !== 'bearer') return null;
+  return token;
+}
+
+function loadOAuthConfig() {
+  const hasAnyOAuthEnv = OAUTH_ENV_VARS.some(name => Boolean(process.env[name]));
+  if (!hasAnyOAuthEnv) return null;
+
+  const missing = [
+    'PUBLIC_BASE_URL',
+    'OAUTH_ISSUER_URL',
+    'OAUTH_AUTHORIZATION_URL',
+    'OAUTH_TOKEN_URL',
+    'OAUTH_JWKS_URI',
+    'OAUTH_AUDIENCE',
+  ].filter(name => !process.env[name]);
+
+  if (missing.length) {
+    throw new Error(`OAuth config incomplete. Missing env vars: ${missing.join(', ')}`);
+  }
+
+  const publicBaseUrl = new URL(process.env.PUBLIC_BASE_URL);
+  const issuerUrl = new URL(process.env.OAUTH_ISSUER_URL);
+
+  if (issuerUrl.protocol !== 'https:' && !isLocalHostname(issuerUrl.hostname)) {
+    throw new Error('OAUTH_ISSUER_URL must use HTTPS unless it targets localhost');
+  }
+
+  return {
+    publicBaseUrl,
+    mcpUrl: new URL('/mcp', publicBaseUrl),
+    issuerUrl,
+    authorizationUrl: new URL(process.env.OAUTH_AUTHORIZATION_URL),
+    tokenUrl: new URL(process.env.OAUTH_TOKEN_URL),
+    jwksUrl: new URL(process.env.OAUTH_JWKS_URI),
+    registrationUrl: process.env.OAUTH_REGISTRATION_URL ? new URL(process.env.OAUTH_REGISTRATION_URL) : null,
+    audiences: parseCsv(process.env.OAUTH_AUDIENCE),
+    scopes: parseCsv(process.env.OAUTH_SCOPES),
+  };
+}
+
+let oauthConfig = null;
+try {
+  oauthConfig = loadOAuthConfig();
+} catch (err) {
+  process.stderr.write(`Fatal: ${err.message}\n`);
+  process.exit(1);
+}
+
+const oauthMetadata = oauthConfig ? {
+  issuer: oauthConfig.issuerUrl.href,
+  authorization_endpoint: oauthConfig.authorizationUrl.href,
+  token_endpoint: oauthConfig.tokenUrl.href,
+  registration_endpoint: oauthConfig.registrationUrl?.href,
+  response_types_supported: ['code'],
+  grant_types_supported: ['authorization_code', 'refresh_token'],
+  code_challenge_methods_supported: ['S256'],
+  token_endpoint_auth_methods_supported: ['client_secret_post', 'none'],
+  scopes_supported: oauthConfig.scopes.length ? oauthConfig.scopes : undefined,
+} : null;
+
+let josePromise = null;
+let oauthJwks = null;
+
+async function getJose() {
+  josePromise = josePromise || import('jose');
+  return josePromise;
+}
+
+async function verifyOAuthAccessToken(token) {
+  const { createRemoteJWKSet, jwtVerify } = await getJose();
+  oauthJwks = oauthJwks || createRemoteJWKSet(oauthConfig.jwksUrl);
+
+  const verifyOptions = { issuer: oauthConfig.issuerUrl.href };
+  if (oauthConfig.audiences.length === 1) {
+    verifyOptions.audience = oauthConfig.audiences[0];
+  } else if (oauthConfig.audiences.length > 1) {
+    verifyOptions.audience = oauthConfig.audiences;
+  }
+
+  const { payload } = await jwtVerify(token, oauthJwks, verifyOptions);
+
+  let scopeString = '';
+  if (typeof payload.scope === 'string') {
+    scopeString = payload.scope;
+  } else if (typeof payload.scp === 'string') {
+    scopeString = payload.scp;
+  } else if (Array.isArray(payload.scp)) {
+    scopeString = payload.scp.join(' ');
+  }
+
+  return {
+    token,
+    clientId: typeof payload.client_id === 'string'
+      ? payload.client_id
+      : (typeof payload.azp === 'string' ? payload.azp : undefined),
+    scopes: scopeString ? scopeString.split(/\s+/).filter(Boolean) : [],
+    expiresAt: typeof payload.exp === 'number' ? payload.exp : NaN,
+  };
+}
 
 const app = express();
 app.use(express.json());
@@ -49,12 +175,40 @@ app.use((req, res, next) => {
   next();
 });
 
+if (oauthConfig) {
+  app.use(mcpAuthMetadataRouter({
+    oauthMetadata,
+    resourceServerUrl: oauthConfig.mcpUrl,
+    scopesSupported: oauthConfig.scopes.length ? oauthConfig.scopes : undefined,
+    resourceName: 'Spiral Memory MCP',
+  }));
+}
+
 // --- Auth middleware (skips /openapi.json and /) ---
 function requireAuth(req, res, next) {
   if (!API_KEY) return next();
   const key = req.headers['x-api-key'] || req.headers['authorization']?.replace('Bearer ', '');
   if (key !== API_KEY) return res.status(401).json({ error: 'Invalid API key' });
   next();
+}
+
+const requireMcpBearerAuth = oauthConfig
+  ? requireBearerAuth({
+      verifier: { verifyAccessToken: verifyOAuthAccessToken },
+      requiredScopes: oauthConfig.scopes,
+      resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(oauthConfig.mcpUrl),
+    })
+  : null;
+
+function requireMcpAuth(req, res, next) {
+  const apiKey = req.headers['x-api-key'];
+  if (API_KEY && apiKey === API_KEY) return next();
+
+  const bearerToken = getBearerToken(req);
+  if (API_KEY && bearerToken === API_KEY) return next();
+
+  if (!requireMcpBearerAuth) return requireAuth(req, res, next);
+  return requireMcpBearerAuth(req, res, next);
 }
 
 // ── MCP tool definitions (shared between stdio and HTTP transports) ──────────
@@ -160,7 +314,7 @@ function createMcpServer() {
   return server;
 }
 
-app.all('/mcp', requireAuth, async (req, res) => {
+app.all('/mcp', requireMcpAuth, async (req, res) => {
   try {
     const sessionId = req.headers['mcp-session-id'];
 
@@ -210,6 +364,9 @@ app.all('/mcp', requireAuth, async (req, res) => {
 const sseConnections = new Map();
 
 app.get('/sse', async (req, res) => {
+  if (oauthConfig) {
+    return res.status(410).json({ error: 'Legacy SSE transport is disabled when OAuth is enabled. Use /mcp.' });
+  }
   const transport = new SSEServerTransport('/messages', res);
   const server = createMcpServer();
   sseConnections.set(transport.sessionId, { transport, server });
@@ -218,6 +375,9 @@ app.get('/sse', async (req, res) => {
 });
 
 app.post('/messages', async (req, res) => {
+  if (oauthConfig) {
+    return res.status(410).json({ error: 'Legacy SSE transport is disabled when OAuth is enabled. Use /mcp.' });
+  }
   const sessionId = req.query.sessionId;
   const conn = sseConnections.get(sessionId);
   if (!conn) return res.status(404).json({ error: 'Session not found' });
@@ -368,7 +528,15 @@ app.listen(PORT, () => {
   process.stderr.write(`  MCP (Claude Desktop/Code): POST https://your-domain/mcp\n`);
   process.stderr.write(`  REST (ChatGPT):             GET  https://your-domain/recall\n`);
   process.stderr.write(`  OpenAPI spec:               GET  https://your-domain/openapi.json\n`);
-  if (API_KEY) {
+  if (oauthConfig) {
+    process.stderr.write(`  MCP OAuth metadata:         ${getOAuthProtectedResourceMetadataUrl(oauthConfig.mcpUrl)}\n`);
+    process.stderr.write(`  OAuth issuer:               ${oauthConfig.issuerUrl.href}\n`);
+  }
+  if (oauthConfig && API_KEY) {
+    process.stderr.write(`  Auth: OAuth required for /mcp, API key fallback enabled, REST uses API key\n`);
+  } else if (oauthConfig) {
+    process.stderr.write(`  Auth: OAuth required for /mcp, REST remains open unless API_KEY is set\n`);
+  } else if (API_KEY) {
     process.stderr.write(`  Auth: API key required\n`);
   } else {
     process.stderr.write(`  Auth: none (set API_KEY env var to enable)\n`);
