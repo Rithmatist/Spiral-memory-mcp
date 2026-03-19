@@ -30,6 +30,7 @@ const express = require('../node_modules/express');
 const { randomUUID } = require('crypto');
 const { Server } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/index.js');
 const { StreamableHTTPServerTransport } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/streamableHttp.js');
+const { SSEServerTransport } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/server/sse.js');
 const { CallToolRequestSchema, ListToolsRequestSchema } = require('../node_modules/@modelcontextprotocol/sdk/dist/cjs/types.js');
 const store = require('./store');
 
@@ -202,6 +203,25 @@ app.all('/mcp', requireAuth, async (req, res) => {
       res.status(500).json({ error: err.message });
     }
   }
+});
+
+
+// ── SSE transport (for ChatGPT and older MCP clients) ────────────────────────
+const sseConnections = new Map();
+
+app.get('/sse', async (req, res) => {
+  const transport = new SSEServerTransport('/messages', res);
+  const server = createMcpServer();
+  sseConnections.set(transport.sessionId, { transport, server });
+  transport.onclose = () => sseConnections.delete(transport.sessionId);
+  await server.connect(transport);
+});
+
+app.post('/messages', async (req, res) => {
+  const sessionId = req.query.sessionId;
+  const conn = sseConnections.get(sessionId);
+  if (!conn) return res.status(404).json({ error: 'Session not found' });
+  await conn.transport.handlePostMessage(req, res, req.body);
 });
 
 // ── REST routes (for ChatGPT) ─────────────────────────────────────────────────
